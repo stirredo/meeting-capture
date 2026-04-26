@@ -149,13 +149,17 @@ def cmd_uninstall(_args) -> int:
     return 0
 
 
-def cmd_devices(_args) -> int:
-    import sounddevice as sd
+def cmd_check(_args) -> int:
+    from .recorder import find_audiotee
 
-    for idx, dev in enumerate(sd.query_devices()):
-        if dev["max_input_channels"] > 0:
-            marker = " <- BlackHole" if "blackhole" in dev["name"].lower() else ""
-            print(f"  [{idx}] {dev['name']} ({dev['max_input_channels']} ch){marker}")
+    binary = find_audiotee()
+    if binary is None:
+        print("audiotee: NOT FOUND. Run setup.sh to build it.")
+        return 1
+    print(f"audiotee: {binary}")
+    print("Trigger the audio-capture permission prompt by running:")
+    print(f"  {binary} --sample-rate 16000 > /dev/null")
+    print("Approve the prompt in System Settings -> Privacy & Security -> Audio Capture.")
     return 0
 
 
@@ -171,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("run", help="run daemon in foreground").set_defaults(func=cmd_run)
     sub.add_parser("install", help="install launchd auto-start agent").set_defaults(func=cmd_install)
     sub.add_parser("uninstall", help="remove launchd agent").set_defaults(func=cmd_uninstall)
-    sub.add_parser("devices", help="list audio input devices").set_defaults(func=cmd_devices)
+    sub.add_parser("check", help="verify audiotee is built and prompt audio-capture permission").set_defaults(func=cmd_check)
 
     args = parser.parse_args(argv)
     return args.func(args)

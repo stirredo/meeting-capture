@@ -1,37 +1,60 @@
-"""Always-on audio capture from BlackHole, chunked by silence."""
+"""Always-on system audio capture via the audiotee CLI (Core Audio Tap, macOS 14.2+).
+
+audiotee streams raw PCM (int16, mono, configurable sample rate) on stdout. We read
+that stream, chunk by silence, and emit WAV files for the transcriber. No driver,
+no sudo, no kernel extension — only the user-grantable Audio Capture TCC permission.
+"""
 from __future__ import annotations
 
-import queue
+import os
+import shutil
+import subprocess
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import sounddevice as sd
 import soundfile as sf
 
 SAMPLE_RATE = 16_000
 CHANNELS = 1
-BLOCK_SECONDS = 0.25
+BYTES_PER_SAMPLE = 2  # int16 little-endian (audiotee resampled mode)
+CHUNK_DURATION = 0.25  # how often audiotee flushes to stdout
+SAMPLES_PER_BLOCK = int(SAMPLE_RATE * CHUNK_DURATION)
+BLOCK_BYTES = SAMPLES_PER_BLOCK * CHANNELS * BYTES_PER_SAMPLE
+
 SILENCE_RMS = 0.005
 SILENCE_GAP_SECONDS = 3.0
 MIN_CHUNK_SECONDS = 8.0
 MAX_CHUNK_SECONDS = 600.0
-DEVICE_NAME_HINT = "BlackHole"
+
+AUDIOTEE_ENV_VAR = "MEETING_CAPTURE_AUDIOTEE"
 
 
-def find_input_device(name_hint: str = DEVICE_NAME_HINT) -> int | None:
-    for idx, dev in enumerate(sd.query_devices()):
-        if dev["max_input_channels"] > 0 and name_hint.lower() in dev["name"].lower():
-            return idx
-    return None
+def find_audiotee() -> Path | None:
+    """Locate the audiotee binary. Search order: env var, vendored bin/, PATH."""
+    env = os.environ.get(AUDIOTEE_ENV_VAR)
+    if env and Path(env).is_file():
+        return Path(env)
+
+    pkg_dir = Path(__file__).resolve().parent
+    for ancestor in [pkg_dir, *pkg_dir.parents]:
+        candidate = ancestor / "bin" / "audiotee"
+        if candidate.is_file():
+            return candidate
+        if (ancestor / ".git").exists():
+            break
+
+    on_path = shutil.which("audiotee")
+    return Path(on_path) if on_path else None
 
 
-def _rms(block: np.ndarray) -> float:
+def _rms_int16(block: np.ndarray) -> float:
     if block.size == 0:
         return 0.0
-    return float(np.sqrt(np.mean(np.square(block, dtype=np.float64))))
+    floats = block.astype(np.float32) / 32768.0
+    return float(np.sqrt(np.mean(np.square(floats, dtype=np.float64))))
 
 
 @dataclass
@@ -45,39 +68,33 @@ def stream_chunks(
     out_dir: Path,
     is_paused,
     sample_rate: int = SAMPLE_RATE,
-    device: int | None = None,
+    audiotee_path: Path | None = None,
 ) -> Iterator[Chunk]:
-    """Yield finished audio chunks. Caller drives consumption (transcription, cleanup)."""
-    device = device if device is not None else find_input_device()
-    if device is None:
+    """Yield finished audio chunks. Spawns audiotee, reads PCM, chunks by silence."""
+    binary = audiotee_path or find_audiotee()
+    if binary is None:
         raise RuntimeError(
-            "No BlackHole input device found. Run `brew install blackhole-2ch` and "
-            "configure a Multi-Output Device in Audio MIDI Setup."
+            "audiotee binary not found. Run setup.sh to build it, or set "
+            f"{AUDIOTEE_ENV_VAR}=/path/to/audiotee."
         )
 
-    block_size = int(sample_rate * BLOCK_SECONDS)
-    blocks: queue.Queue[np.ndarray] = queue.Queue()
+    cmd = [str(binary), "--sample-rate", str(sample_rate), "--chunk-duration", str(CHUNK_DURATION)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+    if proc.stdout is None:
+        raise RuntimeError("audiotee subprocess has no stdout")
 
-    def callback(indata, frames, time_info, status):
-        blocks.put(indata.copy())
+    block_bytes = int(sample_rate * CHUNK_DURATION) * CHANNELS * BYTES_PER_SAMPLE
 
     buffer: list[np.ndarray] = []
     chunk_started: float | None = None
     silent_run = 0.0
 
-    with sd.InputStream(
-        samplerate=sample_rate,
-        channels=CHANNELS,
-        device=device,
-        blocksize=block_size,
-        dtype="float32",
-        callback=callback,
-    ):
+    try:
         while True:
-            try:
-                block = blocks.get(timeout=1.0)
-            except queue.Empty:
-                continue
+            raw = proc.stdout.read(block_bytes)
+            if not raw:
+                break
+            block = np.frombuffer(raw, dtype="<i2")
 
             if is_paused():
                 buffer.clear()
@@ -85,7 +102,7 @@ def stream_chunks(
                 silent_run = 0.0
                 continue
 
-            level = _rms(block)
+            level = _rms_int16(block)
             if level >= SILENCE_RMS:
                 if chunk_started is None:
                     chunk_started = time.time()
@@ -93,9 +110,9 @@ def stream_chunks(
                 silent_run = 0.0
             elif buffer:
                 buffer.append(block)
-                silent_run += BLOCK_SECONDS
+                silent_run += CHUNK_DURATION
 
-            duration = len(buffer) * BLOCK_SECONDS
+            duration = sum(len(b) for b in buffer) / sample_rate
             if buffer and (
                 (silent_run >= SILENCE_GAP_SECONDS and duration >= MIN_CHUNK_SECONDS)
                 or duration >= MAX_CHUNK_SECONDS
@@ -106,23 +123,28 @@ def stream_chunks(
                 chunk_started = None
                 silent_run = 0.0
 
-                trimmed = _trim_trailing_silence(audio)
+                trimmed = _trim_trailing_silence(audio, sample_rate)
                 if len(trimmed) / sample_rate < MIN_CHUNK_SECONDS:
                     continue
 
                 path = out_dir / f"chunk-{int(started)}.wav"
                 sf.write(path, trimmed, sample_rate, subtype="PCM_16")
                 yield Chunk(path=path, started_at=started, duration_seconds=len(trimmed) / sample_rate)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 def _trim_trailing_silence(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
-    window = int(sample_rate * BLOCK_SECONDS)
+    window = int(sample_rate * CHUNK_DURATION)
     if window <= 0 or audio.size <= window:
         return audio
     end = audio.shape[0]
     while end > window:
-        chunk = audio[end - window : end]
-        if _rms(chunk) >= SILENCE_RMS:
+        if _rms_int16(audio[end - window : end]) >= SILENCE_RMS:
             break
         end -= window
     return audio[:end]
