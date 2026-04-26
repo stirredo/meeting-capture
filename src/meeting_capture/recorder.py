@@ -1,8 +1,16 @@
-"""Always-on system audio capture via the audiotee CLI (Core Audio Tap, macOS 14.2+).
+"""Always-on system audio capture via the sysaudio CLI (ScreenCaptureKit, macOS 13+).
 
-audiotee streams raw PCM (int16, mono, configurable sample rate) on stdout. We read
-that stream, chunk by silence, and emit WAV files for the transcriber. No driver,
-no sudo, no kernel extension — only the user-grantable Audio Capture TCC permission.
+sysaudio is our own small Swift binary that uses ScreenCaptureKit's SCStream
+with capturesAudio=true to tap system audio output. Streams raw int16 LE mono
+PCM on stdout. We read that, chunk by silence, and emit WAV files for the
+transcriber. No driver, no sudo, no kernel extension — only the user-grantable
+Screen Recording TCC permission (granted to the parent terminal/launcher).
+
+We previously used audiotee (Core Audio Process Tap, macOS 14.2+). Switched
+2026-04-26 because Process Tap silently captured zeros on the dev machine —
+no errors logged, "audio device started successfully" — but every PCM byte
+was 0. Survived `sudo killall coreaudiod` and a reboot. SCK has a different
+underlying mechanism and worked immediately. Lesson preserved as repo_knowledge.
 """
 from __future__ import annotations
 
@@ -29,11 +37,13 @@ SILENCE_GAP_SECONDS = 3.0
 MIN_CHUNK_SECONDS = 8.0
 MAX_CHUNK_SECONDS = 600.0
 
+SYSAUDIO_ENV_VAR = "MEETING_CAPTURE_SYSAUDIO"
+# Back-compat: also accept the old audiotee env var if set.
 AUDIOTEE_ENV_VAR = "MEETING_CAPTURE_AUDIOTEE"
 
 
 def find_audiotee() -> Path | None:
-    """Locate the audiotee binary. Search order: env var, vendored bin/, PATH."""
+    """Locate the audiotee binary. Kept for back-compat / fallback only."""
     env = os.environ.get(AUDIOTEE_ENV_VAR)
     if env and Path(env).is_file():
         return Path(env)
@@ -48,6 +58,29 @@ def find_audiotee() -> Path | None:
 
     on_path = shutil.which("audiotee")
     return Path(on_path) if on_path else None
+
+
+def find_sysaudio() -> Path | None:
+    """Locate the sysaudio (ScreenCaptureKit) binary."""
+    env = os.environ.get(SYSAUDIO_ENV_VAR)
+    if env and Path(env).is_file():
+        return Path(env)
+
+    pkg_dir = Path(__file__).resolve().parent
+    for ancestor in [pkg_dir, *pkg_dir.parents]:
+        candidate = ancestor / "bin" / "sysaudio"
+        if candidate.is_file():
+            return candidate
+        if (ancestor / ".git").exists():
+            break
+
+    on_path = shutil.which("sysaudio")
+    return Path(on_path) if on_path else None
+
+
+def find_capture_binary() -> Path | None:
+    """Find the audio-capture binary to spawn. Prefer sysaudio (SCK), fall back to audiotee."""
+    return find_sysaudio() or find_audiotee()
 
 
 def _rms_int16(block: np.ndarray) -> float:
@@ -71,25 +104,28 @@ def stream_chunks(
     out_dir: Path,
     should_record,
     sample_rate: int = SAMPLE_RATE,
-    audiotee_path: Path | None = None,
+    capture_binary: Path | None = None,
 ) -> Iterator[Chunk]:
     """Yield finished audio chunks while should_record() is True.
 
-    Spawns audiotee, reads PCM, chunks by silence. When should_record() flips to
-    False (e.g. the user hangs up), the in-flight buffer is flushed as a final
-    chunk if it's at least FLUSH_MIN_SECONDS long, then the iterator exits and
-    audiotee is terminated. This keeps the tail of a meeting from being lost.
+    Spawns the audio-capture binary (sysaudio first, audiotee as fallback),
+    reads int16 LE mono PCM from its stdout, chunks by silence. When
+    should_record() flips to False (e.g. the user hangs up), the in-flight
+    buffer is flushed as a final chunk if it's at least FLUSH_MIN_SECONDS
+    long, then the iterator exits and the subprocess is terminated.
     """
-    binary = audiotee_path or find_audiotee()
+    binary = capture_binary or find_capture_binary()
     if binary is None:
         raise RuntimeError(
-            "audiotee binary not found. Run setup.sh to build it, or set "
-            f"{AUDIOTEE_ENV_VAR}=/path/to/audiotee."
+            "No audio-capture binary found (sysaudio or audiotee). Run setup.sh "
+            f"to build, or set {SYSAUDIO_ENV_VAR}=/path/to/sysaudio."
         )
 
-    cmd = [str(binary), "--sample-rate", str(sample_rate), "--chunk-duration", str(CHUNK_DURATION)]
-    # Inherit our stderr so audiotee's JSON diagnostic log lands in the daemon log via launchd.
-    # (Without this we have no visibility when the tap silently captures zeros.)
+    # sysaudio takes only --sample-rate. audiotee also accepts --chunk-duration.
+    cmd = [str(binary), "--sample-rate", str(sample_rate)]
+    if binary.name == "audiotee":
+        cmd += ["--chunk-duration", str(CHUNK_DURATION)]
+    # Inherit our stderr so the binary's diagnostic log lands in the daemon log via launchd.
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=0)
     if proc.stdout is None:
         raise RuntimeError("audiotee subprocess has no stdout")

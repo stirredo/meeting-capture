@@ -48,6 +48,41 @@ def test_find_audiotee_returns_none_when_missing(monkeypatch):
     assert recorder.find_audiotee() is None
 
 
+def test_find_sysaudio_via_env(tmp_path, monkeypatch):
+    fake = tmp_path / "sysaudio"
+    fake.write_text("")
+    monkeypatch.setenv(recorder.SYSAUDIO_ENV_VAR, str(fake))
+    assert recorder.find_sysaudio() == fake
+
+
+def test_find_sysaudio_returns_none_when_missing(monkeypatch):
+    monkeypatch.delenv(recorder.SYSAUDIO_ENV_VAR, raising=False)
+    monkeypatch.setattr(recorder.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(recorder.Path, "is_file", lambda self: False)
+    assert recorder.find_sysaudio() is None
+
+
+def test_find_capture_binary_prefers_sysaudio(tmp_path, monkeypatch):
+    fake_sysaudio = tmp_path / "sysaudio"
+    fake_audiotee = tmp_path / "audiotee"
+    fake_sysaudio.write_text("")
+    fake_audiotee.write_text("")
+    monkeypatch.setenv(recorder.SYSAUDIO_ENV_VAR, str(fake_sysaudio))
+    monkeypatch.setenv(recorder.AUDIOTEE_ENV_VAR, str(fake_audiotee))
+    assert recorder.find_capture_binary() == fake_sysaudio
+
+
+def test_find_capture_binary_falls_back_to_audiotee(tmp_path, monkeypatch):
+    fake_audiotee = tmp_path / "audiotee"
+    fake_audiotee.write_text("")
+    monkeypatch.delenv(recorder.SYSAUDIO_ENV_VAR, raising=False)
+    monkeypatch.setenv(recorder.AUDIOTEE_ENV_VAR, str(fake_audiotee))
+    monkeypatch.setattr(recorder.shutil, "which", lambda name: None)
+    # Also need to patch the bin/ search; easiest is monkeypatching find_sysaudio to None
+    monkeypatch.setattr(recorder, "find_sysaudio", lambda: None)
+    assert recorder.find_capture_binary() == fake_audiotee
+
+
 def test_flush_min_seconds_constant_exists():
     assert recorder.FLUSH_MIN_SECONDS > 0
     assert recorder.FLUSH_MIN_SECONDS < recorder.MIN_CHUNK_SECONDS

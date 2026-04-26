@@ -236,16 +236,27 @@ def cmd_uninstall(_args) -> int:
 
 
 def cmd_check(_args) -> int:
-    from .recorder import find_audiotee
+    from .recorder import find_audiotee, find_sysaudio
 
-    binary = find_audiotee()
-    if binary is None:
-        print("audiotee: NOT FOUND. Run setup.sh to build it.")
+    sysaudio = find_sysaudio()
+    audiotee = find_audiotee()
+
+    if sysaudio is None and audiotee is None:
+        print("No audio-capture binary found. Run setup.sh to build sysaudio.")
         return 1
-    print(f"audiotee: {binary}")
-    print("Trigger the audio-capture permission prompt by running:")
-    print(f"  {binary} --sample-rate 16000 > /dev/null")
-    print("Approve the prompt in System Settings -> Privacy & Security -> Audio Capture.")
+
+    if sysaudio is not None:
+        print(f"sysaudio (SCK):    {sysaudio}")
+        print("  Permission: System Settings -> Privacy & Security -> Screen & System Audio Recording.")
+        print("  Permission attaches to the parent terminal/launcher (Warp, Terminal, iTerm, etc.).")
+    else:
+        print("sysaudio (SCK):    NOT FOUND")
+
+    if audiotee is not None:
+        print(f"audiotee (Tap):    {audiotee}  (fallback)")
+        print("  Permission: System Settings -> Privacy & Security -> System Audio Recording Only.")
+    else:
+        print("audiotee (Tap):    not built (fine, fallback only)")
     return 0
 
 

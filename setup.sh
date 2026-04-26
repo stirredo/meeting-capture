@@ -4,8 +4,6 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="$SCRIPT_DIR/.venv"
 PY="$VENV/bin/python"
-VENDOR="$SCRIPT_DIR/vendor/audiotee"
-BIN="$SCRIPT_DIR/bin/audiotee"
 
 echo "Setting up meeting-capture..."
 
@@ -32,30 +30,24 @@ if ! command -v ffmpeg &>/dev/null; then
     fi
 fi
 
-# 2. Build audiotee (Core Audio Tap CLI — no driver, no sudo)
-mkdir -p "$SCRIPT_DIR/vendor" "$SCRIPT_DIR/bin"
-if [ ! -d "$VENDOR/.git" ]; then
-    echo "Cloning audiotee..."
-    git clone --depth=1 https://github.com/makeusabrew/audiotee.git "$VENDOR"
-else
-    echo "Updating audiotee..."
-    git -C "$VENDOR" pull --ff-only --quiet || true
-fi
+# 2. Build sysaudio (our ScreenCaptureKit-based audio capture binary)
+mkdir -p "$SCRIPT_DIR/bin"
+SYSAUDIO_BIN="$SCRIPT_DIR/bin/sysaudio"
 
-echo "Building audiotee (release)..."
-(cd "$VENDOR" && swift build -c release --quiet)
+echo "Building sysaudio (SCK, release)..."
+(cd "$SCRIPT_DIR/swift" && swift build -c release --quiet)
 
-BIN_DIR=$(cd "$VENDOR" && swift build -c release --show-bin-path)
-BUILT="$BIN_DIR/audiotee"
-if [ ! -x "$BUILT" ]; then
-    echo "audiotee build failed — no binary at $BUILT"
+SYSAUDIO_BUILT_DIR=$(cd "$SCRIPT_DIR/swift" && swift build -c release --show-bin-path)
+SYSAUDIO_BUILT="$SYSAUDIO_BUILT_DIR/sysaudio"
+if [ ! -x "$SYSAUDIO_BUILT" ]; then
+    echo "sysaudio build failed — no binary at $SYSAUDIO_BUILT"
     exit 1
 fi
 
-cp "$BUILT" "$BIN"
-codesign --force --sign - "$BIN" 2>/dev/null || true
-chmod +x "$BIN"
-echo "audiotee binary: $BIN"
+cp "$SYSAUDIO_BUILT" "$SYSAUDIO_BIN"
+codesign --force --sign - "$SYSAUDIO_BIN" 2>/dev/null || true
+chmod +x "$SYSAUDIO_BIN"
+echo "sysaudio binary: $SYSAUDIO_BIN"
 
 # 3. venv + install
 if [ ! -d "$VENV" ]; then
@@ -69,9 +61,9 @@ echo "Installing meeting-capture..."
 
 # 4. One-time TCC permission prompt
 echo ""
-echo "Triggering audio-capture permission prompt (approve in System Settings)..."
+echo "Triggering screen-recording permission prompt (approve in System Settings)..."
 echo "  (Will exit after ~2 seconds.)"
-"$BIN" --sample-rate 16000 >/dev/null 2>&1 &
+"$SYSAUDIO_BIN" --sample-rate 16000 >/dev/null 2>&1 &
 PROBE_PID=$!
 sleep 2
 kill "$PROBE_PID" 2>/dev/null || true
@@ -81,11 +73,13 @@ wait "$PROBE_PID" 2>/dev/null || true
 cat <<EOF
 
 Done. Next steps:
-  $PY -m meeting_capture.cli check     # confirm audiotee + permission
+  $PY -m meeting_capture.cli check     # confirm sysaudio + permission
   $PY -m meeting_capture.cli install   # launchd auto-start at login
   $PY -m meeting_capture.cli status
 
-Permission: System Settings -> Privacy & Security -> Audio Capture -> allow audiotee.
+Permission: System Settings -> Privacy & Security -> Screen & System Audio Recording.
+The permission attaches to the parent terminal (Warp / Terminal / iTerm), not the
+binary itself — restart the terminal once after granting.
 
 Transcripts land in ~/transcripts/ (picked up by context-orchestrator's transcript-watcher).
 Pause:  touch ~/.meeting-capture/paused

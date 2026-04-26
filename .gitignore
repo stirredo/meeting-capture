@@ -9,6 +9,7 @@ build/
 plans/
 vendor/
 bin/
+swift/.build/
 *.wav
 *.flac
 *.aiff
