@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+from .mic import is_mic_active, mic_name
 from .paths import (
     AUDIO_DIR,
     LOG_FILE,
@@ -21,6 +22,7 @@ from .recorder import Chunk, stream_chunks
 from .transcriber import transcribe
 
 SESSION_GAP_SECONDS = 15 * 60
+MIC_POLL_INTERVAL = 2.0
 
 log = logging.getLogger("meeting-capture")
 
@@ -77,38 +79,51 @@ def run() -> None:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    log.info("meeting-capture daemon starting (pid=%s)", os.getpid())
+    log.info("meeting-capture daemon starting (pid=%s, mic=%s)", os.getpid(), mic_name() or "unknown")
 
     current_session: Path | None = None
     last_chunk_end: float = 0.0
 
+    def _should_record() -> bool:
+        return is_mic_active() and not _is_paused()
+
     try:
-        for chunk in stream_chunks(AUDIO_DIR, _is_paused):
-            chunk_end = chunk.started_at + chunk.duration_seconds
-            if current_session is None or (chunk.started_at - last_chunk_end) > SESSION_GAP_SECONDS:
-                current_session = _session_path(chunk.started_at)
-                log.info("new session: %s", current_session.name)
+        while True:
+            # Outer loop: idle until the mic is in use by another app (= we're in a call).
+            while not _should_record():
+                time.sleep(MIC_POLL_INTERVAL)
 
-            try:
-                text = transcribe(chunk.path)
-            except Exception as exc:
-                log.exception("transcription failed for %s: %s", chunk.path, exc)
-                text = ""
+            log.info("mic active — starting recording session")
 
-            _append(current_session, chunk, text)
-            last_chunk_end = chunk_end
+            # Inner loop: stream chunks until the mic goes off (or pause is set).
+            for chunk in stream_chunks(AUDIO_DIR, _should_record):
+                chunk_end = chunk.started_at + chunk.duration_seconds
+                if current_session is None or (chunk.started_at - last_chunk_end) > SESSION_GAP_SECONDS:
+                    current_session = _session_path(chunk.started_at)
+                    log.info("new session: %s", current_session.name)
 
-            try:
-                chunk.path.unlink()
-            except FileNotFoundError:
-                pass
+                try:
+                    text = transcribe(chunk.path)
+                except Exception as exc:
+                    log.exception("transcription failed for %s: %s", chunk.path, exc)
+                    text = ""
 
-            log.info(
-                "chunk %.1fs -> %s (%d chars)",
-                chunk.duration_seconds,
-                current_session.name if current_session else "?",
-                len(text),
-            )
+                _append(current_session, chunk, text)
+                last_chunk_end = chunk_end
+
+                try:
+                    chunk.path.unlink()
+                except FileNotFoundError:
+                    pass
+
+                log.info(
+                    "chunk %.1fs -> %s (%d chars)",
+                    chunk.duration_seconds,
+                    current_session.name if current_session else "?",
+                    len(text),
+                )
+
+            log.info("mic inactive — session ended")
     except KeyboardInterrupt:
         log.info("interrupted")
     finally:

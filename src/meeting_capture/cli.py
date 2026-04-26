@@ -1,4 +1,4 @@
-"""CLI: meeting-capture {start,stop,pause,resume,status,install,uninstall,run}."""
+"""CLI: meeting-capture {start,stop,pause,resume,status,install,uninstall,run,mic,last,tail}."""
 from __future__ import annotations
 
 import argparse
@@ -7,9 +7,11 @@ import plistlib
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from . import __version__
+from .mic import is_mic_active, mic_name
 from .paths import (
     AUDIO_DIR,
     LAUNCHD_LABEL,
@@ -39,17 +41,96 @@ def _is_running(pid: int) -> bool:
         return False
 
 
+def _format_age(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s ago"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86400)}d ago"
+
+
+def _last_transcript() -> Path | None:
+    if not TRANSCRIPTS_DIR.exists():
+        return None
+    files = sorted(TRANSCRIPTS_DIR.glob("meeting-*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0] if files else None
+
+
+def _last_chunk_log_line() -> str | None:
+    if not LOG_FILE.exists():
+        return None
+    try:
+        with LOG_FILE.open("r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if "chunk " in line and " -> " in line:
+            return line.rstrip()
+    return None
+
+
 def cmd_status(_args) -> int:
     ensure_dirs()
     pid = _read_pid()
     running = pid is not None and _is_running(pid)
     paused = PAUSE_FILE.exists()
+    mic_on = is_mic_active()
+
     print(f"meeting-capture {__version__}")
-    print(f"  daemon:      {'running (pid ' + str(pid) + ')' if running else 'stopped'}")
-    print(f"  paused:      {paused}")
-    print(f"  transcripts: {TRANSCRIPTS_DIR}")
-    print(f"  log:         {LOG_FILE}")
-    print(f"  launchd:     {'installed' if LAUNCHD_PLIST.exists() else 'not installed'}")
+    print(f"  daemon:           {'running (pid ' + str(pid) + ')' if running else 'stopped'}")
+    print(f"  paused:           {paused}")
+    print(f"  mic in use:       {mic_on} ({mic_name() or 'unknown device'})")
+    if running and mic_on and not paused:
+        print(f"  state:            ACTIVELY RECORDING")
+    elif running and not paused:
+        print(f"  state:            idle (waiting for mic to activate)")
+    elif running and paused:
+        print(f"  state:            paused")
+    else:
+        print(f"  state:            not running")
+
+    last = _last_transcript()
+    if last is not None:
+        st = last.stat()
+        size_kb = st.st_size / 1024
+        age = time.time() - st.st_mtime
+        print(f"  last transcript:  {last.name} ({size_kb:.1f} KB, {_format_age(age)})")
+    else:
+        print(f"  last transcript:  (none yet)")
+
+    last_log = _last_chunk_log_line()
+    if last_log is not None:
+        print(f"  last chunk log:   {last_log}")
+
+    print(f"  transcripts dir:  {TRANSCRIPTS_DIR}")
+    print(f"  log file:         {LOG_FILE}")
+    print(f"  launchd:          {'installed' if LAUNCHD_PLIST.exists() else 'not installed'}")
+    return 0
+
+
+def cmd_mic(_args) -> int:
+    print(f"input device:        {mic_name() or '(none)'}")
+    print(f"in use by other app: {is_mic_active()}")
+    return 0
+
+
+def cmd_last(_args) -> int:
+    last = _last_transcript()
+    if last is None:
+        print("(no transcripts yet)", file=sys.stderr)
+        return 1
+    print(last)
+    return 0
+
+
+def cmd_tail(_args) -> int:
+    if not LOG_FILE.exists():
+        print(f"no log file at {LOG_FILE}", file=sys.stderr)
+        return 1
+    subprocess.run(["tail", "-f", str(LOG_FILE)])
     return 0
 
 
@@ -176,6 +257,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("install", help="install launchd auto-start agent").set_defaults(func=cmd_install)
     sub.add_parser("uninstall", help="remove launchd agent").set_defaults(func=cmd_uninstall)
     sub.add_parser("check", help="verify audiotee is built and prompt audio-capture permission").set_defaults(func=cmd_check)
+    sub.add_parser("mic", help="show current mic-activity state (the gate that triggers recording)").set_defaults(func=cmd_mic)
+    sub.add_parser("last", help="print the path of the most recent transcript").set_defaults(func=cmd_last)
+    sub.add_parser("tail", help="follow the daemon log").set_defaults(func=cmd_tail)
 
     args = parser.parse_args(argv)
     return args.func(args)

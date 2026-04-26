@@ -64,13 +64,22 @@ class Chunk:
     duration_seconds: float
 
 
+FLUSH_MIN_SECONDS = 3.0
+
+
 def stream_chunks(
     out_dir: Path,
-    is_paused,
+    should_record,
     sample_rate: int = SAMPLE_RATE,
     audiotee_path: Path | None = None,
 ) -> Iterator[Chunk]:
-    """Yield finished audio chunks. Spawns audiotee, reads PCM, chunks by silence."""
+    """Yield finished audio chunks while should_record() is True.
+
+    Spawns audiotee, reads PCM, chunks by silence. When should_record() flips to
+    False (e.g. the user hangs up), the in-flight buffer is flushed as a final
+    chunk if it's at least FLUSH_MIN_SECONDS long, then the iterator exits and
+    audiotee is terminated. This keeps the tail of a meeting from being lost.
+    """
     binary = audiotee_path or find_audiotee()
     if binary is None:
         raise RuntimeError(
@@ -89,18 +98,20 @@ def stream_chunks(
     chunk_started: float | None = None
     silent_run = 0.0
 
+    def _emit(audio: np.ndarray, started: float, min_seconds: float) -> Chunk | None:
+        trimmed = _trim_trailing_silence(audio, sample_rate)
+        if len(trimmed) / sample_rate < min_seconds:
+            return None
+        path = out_dir / f"chunk-{int(started)}.wav"
+        sf.write(path, trimmed, sample_rate, subtype="PCM_16")
+        return Chunk(path=path, started_at=started, duration_seconds=len(trimmed) / sample_rate)
+
     try:
-        while True:
+        while should_record():
             raw = proc.stdout.read(block_bytes)
             if not raw:
                 break
             block = np.frombuffer(raw, dtype="<i2")
-
-            if is_paused():
-                buffer.clear()
-                chunk_started = None
-                silent_run = 0.0
-                continue
 
             level = _rms_int16(block)
             if level >= SILENCE_RMS:
@@ -118,18 +129,22 @@ def stream_chunks(
                 or duration >= MAX_CHUNK_SECONDS
             ):
                 audio = np.concatenate(buffer, axis=0)
-                buffer.clear()
                 started = chunk_started or time.time()
+                buffer.clear()
                 chunk_started = None
                 silent_run = 0.0
 
-                trimmed = _trim_trailing_silence(audio, sample_rate)
-                if len(trimmed) / sample_rate < MIN_CHUNK_SECONDS:
-                    continue
+                chunk = _emit(audio, started, MIN_CHUNK_SECONDS)
+                if chunk is not None:
+                    yield chunk
 
-                path = out_dir / f"chunk-{int(started)}.wav"
-                sf.write(path, trimmed, sample_rate, subtype="PCM_16")
-                yield Chunk(path=path, started_at=started, duration_seconds=len(trimmed) / sample_rate)
+        # should_record() went False — flush any in-flight buffer
+        if buffer:
+            audio = np.concatenate(buffer, axis=0)
+            started = chunk_started or time.time()
+            chunk = _emit(audio, started, FLUSH_MIN_SECONDS)
+            if chunk is not None:
+                yield chunk
     finally:
         proc.terminate()
         try:

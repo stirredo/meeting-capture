@@ -46,3 +46,8 @@ def test_find_audiotee_returns_none_when_missing(monkeypatch):
     monkeypatch.setattr(recorder.shutil, "which", lambda _name: None)
     monkeypatch.setattr(recorder.Path, "is_file", lambda self: False)
     assert recorder.find_audiotee() is None
+
+
+def test_flush_min_seconds_constant_exists():
+    assert recorder.FLUSH_MIN_SECONDS > 0
+    assert recorder.FLUSH_MIN_SECONDS < recorder.MIN_CHUNK_SECONDS

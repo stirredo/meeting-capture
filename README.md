@@ -11,14 +11,18 @@ Manual save-after-meeting workflows fail in practice (real-world adherence ~40%)
 ## How it works
 
 ```
-System audio  →  audiotee (Core Audio Tap, macOS 14.2+)
-              →  PCM stream on stdout (int16 @ 16kHz mono)
-              →  Python daemon (silence-chunked, ~3s gap = chunk boundary)
-              →  mlx-whisper (local transcription, Apple Silicon)
-              →  ~/transcripts/meeting-YYYY-MM-DDTHH-MM-SS.md
+[mic activates]   →  daemon detects via AVCaptureDevice.isInUseByAnotherApplication
+System audio      →  audiotee (Core Audio Tap, macOS 14.2+)
+                  →  PCM stream on stdout (int16 @ 16kHz mono)
+                  →  Python daemon (silence-chunked, ~3s gap = chunk boundary)
+                  →  mlx-whisper (local transcription, Apple Silicon)
+                  →  ~/transcripts/meeting-YYYY-MM-DDTHH-MM-SS.md
+[mic deactivates] →  audiotee terminated, in-flight chunk flushed, daemon idles
 ```
 
-A new transcript file is started whenever the gap between chunks exceeds 15 minutes (= a new meeting). The daemon stays in the background via launchd; raw audio chunks are deleted after transcription.
+**Mic-activity gating:** the daemon only records when another app (Zoom, Teams, FaceTime, browser meeting, etc.) is using your microphone. Otherwise it sits idle — no audio captured, no CPU spent. This means random YouTube/podcast/music audio is **not** captured; only actual calls are.
+
+A new transcript file is started whenever the gap between chunks exceeds 15 minutes (= a new meeting). Mid-meeting mic mutes don't fragment the file (subsequent chunks within 15 min append to the same session). Raw audio chunks are deleted after transcription. The daemon stays in the background via launchd.
 
 The audio source is [`audiotee`](https://github.com/makeusabrew/audiotee), a tiny Swift CLI that wraps Apple's Core Audio Tap API (`CATapDescription` / `AudioHardwareCreateProcessTap`). This is the same API category that lets Cluely-style tools work without admin rights.
 
@@ -47,7 +51,10 @@ After setup, approve the prompt in **System Settings → Privacy & Security → 
 ```bash
 .venv/bin/meeting-capture check       # verify audiotee + permission
 .venv/bin/meeting-capture install     # install launchd auto-start agent
-.venv/bin/meeting-capture status
+.venv/bin/meeting-capture status      # daemon + mic + last transcript + log line
+.venv/bin/meeting-capture mic         # show current mic-activity state
+.venv/bin/meeting-capture last        # print path of most recent transcript
+.venv/bin/meeting-capture tail        # follow the daemon log
 .venv/bin/meeting-capture pause       # touches ~/.meeting-capture/paused
 .venv/bin/meeting-capture resume
 .venv/bin/meeting-capture stop
