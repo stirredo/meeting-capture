@@ -88,7 +88,9 @@ def stream_chunks(
         )
 
     cmd = [str(binary), "--sample-rate", str(sample_rate), "--chunk-duration", str(CHUNK_DURATION)]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+    # Inherit our stderr so audiotee's JSON diagnostic log lands in the daemon log via launchd.
+    # (Without this we have no visibility when the tap silently captures zeros.)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=0)
     if proc.stdout is None:
         raise RuntimeError("audiotee subprocess has no stdout")
 
