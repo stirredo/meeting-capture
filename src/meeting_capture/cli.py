@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import __version__
-from .mic import is_mic_active, mic_name
+from .mic import active_mic_name, is_mic_active, mic_name
 from .paths import (
     AUDIO_DIR,
     LAUNCHD_LABEL,
@@ -82,7 +82,10 @@ def cmd_status(_args) -> int:
     print(f"meeting-capture {__version__}")
     print(f"  daemon:           {'running (pid ' + str(pid) + ')' if running else 'stopped'}")
     print(f"  paused:           {paused}")
-    print(f"  mic in use:       {mic_on} ({mic_name() or 'unknown device'})")
+    if mic_on:
+        print(f"  mic in use:       True ({active_mic_name() or 'unknown device'})")
+    else:
+        print(f"  mic in use:       False (default: {mic_name() or 'unknown device'})")
     if running and mic_on and not paused:
         print(f"  state:            ACTIVELY RECORDING")
     elif running and not paused:
@@ -112,8 +115,10 @@ def cmd_status(_args) -> int:
 
 
 def cmd_mic(_args) -> int:
-    print(f"input device:        {mic_name() or '(none)'}")
+    print(f"default input:       {mic_name() or '(none)'}")
     print(f"in use by other app: {is_mic_active()}")
+    if is_mic_active():
+        print(f"active device:       {active_mic_name() or '(unknown)'}")
     return 0
 
 

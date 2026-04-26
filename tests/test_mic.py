@@ -2,8 +2,7 @@ from meeting_capture import mic
 
 
 def test_is_mic_active_returns_bool():
-    result = mic.is_mic_active()
-    assert isinstance(result, bool)
+    assert isinstance(mic.is_mic_active(), bool)
 
 
 def test_mic_name_returns_str_or_none():
@@ -11,17 +10,26 @@ def test_mic_name_returns_str_or_none():
     assert name is None or isinstance(name, str)
 
 
-def test_is_mic_active_handles_missing_pyobjc(monkeypatch):
-    """If AVFoundation isn't importable (e.g. on a non-macOS test machine),
-    is_mic_active() should return False rather than raising."""
-    import builtins
-    real_import = builtins.__import__
+def test_active_mic_name_returns_str_or_none():
+    name = mic.active_mic_name()
+    assert name is None or isinstance(name, str)
 
-    def fake_import(name, *args, **kwargs):
-        if name == "AVFoundation":
-            raise ImportError("simulated missing AVFoundation")
-        return real_import(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", fake_import)
+def test_active_mic_name_is_none_when_no_mic_active():
+    if not mic.is_mic_active():
+        assert mic.active_mic_name() is None
+
+
+def test_all_device_ids_returns_list():
+    ids = mic._all_device_ids()
+    assert isinstance(ids, list)
+    assert all(isinstance(i, int) for i in ids)
+
+
+def test_handles_missing_coreaudio(monkeypatch):
+    """If CoreAudio framework can't be loaded (e.g. non-macOS), is_mic_active returns False."""
+    monkeypatch.setattr(mic, "_CA", None)
     assert mic.is_mic_active() is False
     assert mic.mic_name() is None
+    assert mic.active_mic_name() is None
+    assert mic._all_device_ids() == []

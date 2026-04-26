@@ -7,7 +7,6 @@ dependencies = [
     "numpy>=1.24",
     "soundfile>=0.12",
     "mlx-whisper>=0.4.0; sys_platform == 'darwin'",
-    "pyobjc-framework-AVFoundation>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.scripts]

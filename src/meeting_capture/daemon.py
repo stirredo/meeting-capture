@@ -28,10 +28,12 @@ log = logging.getLogger("meeting-capture")
 
 
 def _setup_logging() -> None:
+    # Log to stderr only. launchd routes our stderr → LOG_FILE via StandardErrorPath,
+    # so adding a FileHandler here would double-write every line.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stderr)],
+        stream=sys.stderr,
     )
 
 
