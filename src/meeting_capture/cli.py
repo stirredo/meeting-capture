@@ -132,7 +132,7 @@ def cmd_install(_args) -> int:
     LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
     payload = _plist_payload(sys.executable)
     LAUNCHD_PLIST.write_bytes(payload)
-    subprocess.run(["launchctl", "unload", str(LAUNCHD_PLIST)], check=False)
+    subprocess.run(["launchctl", "unload", str(LAUNCHD_PLIST)], check=False, stderr=subprocess.DEVNULL)
     subprocess.run(["launchctl", "load", "-w", str(LAUNCHD_PLIST)], check=False)
     print(f"installed launchd agent at {LAUNCHD_PLIST}")
     print("daemon will auto-start at login.")
