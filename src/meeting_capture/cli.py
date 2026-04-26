@@ -1,4 +1,4 @@
-"""CLI: meeting-capture {start,stop,pause,resume,status,install,uninstall,run,mic,last,tail}."""
+"""CLI: meeting-capture {start,stop,pause,resume,status,install,uninstall,run,mic,last,tail,doctor}."""
 from __future__ import annotations
 
 import argparse
@@ -139,6 +139,108 @@ def cmd_tail(_args) -> int:
     return 0
 
 
+def cmd_doctor(_args) -> int:
+    """Full health check — every prereq, every binary, every permission, every daemon state."""
+    from shutil import which
+    from .recorder import find_audiotee, find_sysaudio
+    import platform
+
+    failures = 0
+
+    def _ok(label, value=""):
+        suffix = f" — {value}" if value else ""
+        print(f"  ✓ {label}{suffix}")
+
+    def _fail(label, hint):
+        nonlocal failures
+        failures += 1
+        print(f"  ✗ {label}")
+        print(f"      → {hint}")
+
+    print(f"meeting-capture {__version__} — doctor\n")
+
+    print("System:")
+    mac_ver = platform.mac_ver()[0]
+    if mac_ver:
+        major = int(mac_ver.split(".")[0])
+        if major >= 13:
+            _ok(f"macOS {mac_ver}")
+        else:
+            _fail(f"macOS {mac_ver} too old", "Need 13.0+ for ScreenCaptureKit. Update macOS.")
+    arch = platform.machine()
+    if arch == "arm64":
+        _ok("Apple Silicon (arm64)")
+    else:
+        _fail(f"arch is {arch}", "mlx-whisper requires arm64. No fix on Intel.")
+
+    print("\nBinaries:")
+    sysaudio = find_sysaudio()
+    if sysaudio is not None:
+        _ok("sysaudio (SCK)", str(sysaudio))
+    else:
+        _fail("sysaudio not built", "Run setup.sh from the repo root.")
+    audiotee = find_audiotee()
+    if audiotee is not None:
+        print(f"  · audiotee (fallback) — {audiotee}")
+    if which("ffmpeg"):
+        _ok("ffmpeg", which("ffmpeg"))
+    else:
+        _fail("ffmpeg missing", "brew install ffmpeg  (mlx-whisper shells out to it)")
+
+    print("\nMic detection:")
+    name = mic_name()
+    if name:
+        _ok(f"default input device", name)
+    else:
+        _fail("no input device detected", "Check System Settings -> Sound -> Input.")
+    in_use = is_mic_active()
+    print(f"  · mic in use right now: {in_use}{(' — ' + (active_mic_name() or '?')) if in_use else ''}")
+
+    print("\nDaemon:")
+    pid = _read_pid()
+    if pid and _is_running(pid):
+        _ok(f"daemon running (pid {pid})")
+    else:
+        _fail("daemon not running", "meeting-capture install   OR   meeting-capture start")
+    if LAUNCHD_PLIST.exists():
+        _ok(f"launchd plist installed", str(LAUNCHD_PLIST))
+        result = subprocess.run(
+            ["launchctl", "list", LAUNCHD_LABEL], capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            _ok("launchd service loaded")
+        else:
+            _fail("launchd service not loaded", f"launchctl load -w {LAUNCHD_PLIST}")
+    else:
+        _fail("launchd plist not installed", "meeting-capture install")
+
+    print("\nPaths & data:")
+    if TRANSCRIPTS_DIR.exists():
+        n = len(list(TRANSCRIPTS_DIR.glob("meeting-*.md")))
+        _ok(f"transcripts dir", f"{TRANSCRIPTS_DIR} ({n} files)")
+    else:
+        _fail("transcripts dir missing", f"mkdir -p {TRANSCRIPTS_DIR}")
+    if LOG_FILE.exists():
+        size_kb = LOG_FILE.stat().st_size / 1024
+        _ok(f"daemon log", f"{LOG_FILE} ({size_kb:.1f} KB)")
+    else:
+        print(f"  · no log file yet ({LOG_FILE}) — daemon hasn't run")
+
+    print("\nManual gates (cannot be checked from code):")
+    print("  ?  Screen Recording TCC granted to parent terminal (Warp/Terminal/iTerm)")
+    print("     System Settings -> Privacy & Security -> Screen & System Audio Recording")
+    print("  ?  Terminal restarted once after granting permission")
+    print("  ?  Claude Code restarted (so the orchestrator MCP server is live)")
+
+    print()
+    if failures == 0:
+        print("All automatic checks passed. Verify the manual gates above.")
+        return 0
+    else:
+        print(f"{failures} issue(s) above. Fix and re-run `meeting-capture doctor`.")
+        return 1
+
+
 def cmd_pause(_args) -> int:
     ensure_dirs()
     PAUSE_FILE.touch()
@@ -276,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("mic", help="show current mic-activity state (the gate that triggers recording)").set_defaults(func=cmd_mic)
     sub.add_parser("last", help="print the path of the most recent transcript").set_defaults(func=cmd_last)
     sub.add_parser("tail", help="follow the daemon log").set_defaults(func=cmd_tail)
+    sub.add_parser("doctor", help="full health check (binaries, permissions, daemon)").set_defaults(func=cmd_doctor)
 
     args = parser.parse_args(argv)
     return args.func(args)

@@ -5,32 +5,121 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="$SCRIPT_DIR/.venv"
 PY="$VENV/bin/python"
 
+INSTALL_LAUNCHD=1
+for arg in "$@"; do
+    case "$arg" in
+        --no-launchd) INSTALL_LAUNCHD=0 ;;
+        -h|--help)
+            cat <<EOF
+Usage: $0 [--no-launchd]
+
+  --no-launchd    Build & install Python package, but skip launchd auto-start.
+                  Use this if you want to run the daemon manually with
+                  \`meeting-capture run\` instead of having it start at login.
+EOF
+            exit 0
+            ;;
+    esac
+done
+
 echo "Setting up meeting-capture..."
 
-# 1. macOS / Swift toolchain check
-if ! command -v swift &>/dev/null; then
-    echo "Swift not found. Installing Xcode command-line tools (interactive prompt may appear)..."
-    xcode-select --install || true
-    echo "Re-run setup.sh after the install finishes."
+# ---------------------------------------------------------------------------
+# Prereq check — fail loudly with exact next steps if anything's missing.
+# ---------------------------------------------------------------------------
+PREREQS_OK=1
+fail() { echo "  ✗ $1"; PREREQS_OK=0; }
+ok()   { echo "  ✓ $1"; }
+
+echo ""
+echo "Checking prerequisites..."
+
+# macOS version >= 13 (ScreenCaptureKit)
+OS_VERSION=$(sw_vers -productVersion)
+OS_MAJOR=$(echo "$OS_VERSION" | cut -d. -f1)
+if [ "$OS_MAJOR" -ge 13 ]; then
+    ok "macOS $OS_VERSION (>= 13.0 required for ScreenCaptureKit)"
+else
+    fail "macOS $OS_VERSION is too old. Need 13.0+ for ScreenCaptureKit. Update macOS."
+fi
+
+# Apple Silicon (mlx-whisper)
+ARCH=$(uname -m)
+if [ "$ARCH" = "arm64" ]; then
+    ok "Apple Silicon (arm64)"
+else
+    fail "$ARCH is not Apple Silicon. mlx-whisper requires arm64. No fix available on Intel."
+fi
+
+# Python 3.10+
+if command -v python3 &>/dev/null; then
+    PY_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
+    PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
+    if [ "$PY_MAJOR" -ge 3 ] && [ "$PY_MINOR" -ge 10 ]; then
+        ok "Python $PY_VERSION"
+    else
+        fail "Python $PY_VERSION is too old. Need 3.10+. Install via Homebrew (\`brew install python@3.11\`) or python.org."
+    fi
+else
+    fail "python3 not on PATH. Install via Homebrew (\`brew install python@3.11\`) or python.org."
+fi
+
+# git
+if command -v git &>/dev/null; then
+    ok "git $(git --version | awk '{print $3}')"
+else
+    fail "git not on PATH. Comes with Xcode CLI tools (\`xcode-select --install\`)."
+fi
+
+# Xcode CLI tools (Swift compiler)
+if command -v swift &>/dev/null; then
+    ok "Swift $(swift --version | head -1 | awk '{print $4}')"
+else
+    fail "swift not found. Install Xcode CLI tools: \`xcode-select --install\` (interactive)."
+fi
+
+# Homebrew — offer to install
+if command -v brew &>/dev/null; then
+    ok "Homebrew $(brew --version | head -1 | awk '{print $2}')"
+else
+    echo "  ⚠ Homebrew not installed. Need it for ffmpeg (required by mlx-whisper)."
+    read -r -p "    Install Homebrew now? Will prompt for sudo. [y/N] " yn
+    case "$yn" in
+        [Yy]*)
+            NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            # Add brew to PATH for the rest of this script
+            if [ -x /opt/homebrew/bin/brew ]; then
+                eval "$(/opt/homebrew/bin/brew shellenv)"
+                ok "Homebrew installed"
+            else
+                fail "Homebrew install did not produce /opt/homebrew/bin/brew. Install manually from https://brew.sh"
+            fi
+            ;;
+        *)
+            fail "Homebrew required. Install from https://brew.sh and re-run."
+            ;;
+    esac
+fi
+
+if [ "$PREREQS_OK" -eq 0 ]; then
+    echo ""
+    echo "Prerequisites missing. Fix the items marked ✗ above and re-run."
     exit 1
 fi
+echo ""
 
-OS_VERSION=$(sw_vers -productVersion)
-echo "macOS $OS_VERSION, Swift $(swift --version | head -1)"
-
-# 1b. ffmpeg (mlx-whisper shells out to it to decode WAVs)
+# ---------------------------------------------------------------------------
+# 1. ffmpeg (mlx-whisper shells out to it for WAV decode — silent failure if missing)
+# ---------------------------------------------------------------------------
 if ! command -v ffmpeg &>/dev/null; then
-    if command -v brew &>/dev/null; then
-        echo "Installing ffmpeg (mlx-whisper dependency)..."
-        brew install ffmpeg
-    else
-        echo "ERROR: ffmpeg is required by mlx-whisper but not on PATH and brew is not installed."
-        echo "Install ffmpeg manually (e.g. https://evermeet.cx/ffmpeg/) and re-run."
-        exit 1
-    fi
+    echo "Installing ffmpeg (mlx-whisper dependency)..."
+    brew install ffmpeg
 fi
 
-# 2. Build sysaudio (our ScreenCaptureKit-based audio capture binary)
+# ---------------------------------------------------------------------------
+# 2. Build sysaudio (ScreenCaptureKit)
+# ---------------------------------------------------------------------------
 mkdir -p "$SCRIPT_DIR/bin"
 SYSAUDIO_BIN="$SCRIPT_DIR/bin/sysaudio"
 
@@ -49,17 +138,20 @@ codesign --force --sign - "$SYSAUDIO_BIN" 2>/dev/null || true
 chmod +x "$SYSAUDIO_BIN"
 echo "sysaudio binary: $SYSAUDIO_BIN"
 
-# 3. venv + install
+# ---------------------------------------------------------------------------
+# 3. venv + Python install
+# ---------------------------------------------------------------------------
 if [ ! -d "$VENV" ]; then
     echo "Creating virtual environment..."
     python3 -m venv "$VENV"
 fi
-
-echo "Installing meeting-capture..."
+echo "Installing meeting-capture Python package..."
 "$VENV/bin/pip" install -q --upgrade pip
 "$VENV/bin/pip" install -q -e "$SCRIPT_DIR"
 
-# 4. One-time TCC permission prompt
+# ---------------------------------------------------------------------------
+# 4. Trigger the screen-recording permission prompt (one-time)
+# ---------------------------------------------------------------------------
 echo ""
 echo "Triggering screen-recording permission prompt (approve in System Settings)..."
 echo "  (Will exit after ~2 seconds.)"
@@ -69,17 +161,35 @@ sleep 2
 kill "$PROBE_PID" 2>/dev/null || true
 wait "$PROBE_PID" 2>/dev/null || true
 
-# 5. Next steps
+# ---------------------------------------------------------------------------
+# 5. Auto-install launchd agent (skipped with --no-launchd)
+# ---------------------------------------------------------------------------
+if [ "$INSTALL_LAUNCHD" -eq 1 ]; then
+    echo ""
+    echo "Installing launchd auto-start agent..."
+    "$VENV/bin/meeting-capture" install
+else
+    echo ""
+    echo "Skipping launchd install (--no-launchd flag)."
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Done
+# ---------------------------------------------------------------------------
 cat <<EOF
 
-Done. Next steps:
-  $PY -m meeting_capture.cli check     # confirm sysaudio + permission
-  $PY -m meeting_capture.cli install   # launchd auto-start at login
-  $PY -m meeting_capture.cli status
+Done. Diagnostic:
+  $VENV/bin/meeting-capture doctor   # full health check (binaries, permissions, daemon)
+  $VENV/bin/meeting-capture status   # daemon + mic + last transcript
 
-Permission: System Settings -> Privacy & Security -> Screen & System Audio Recording.
-The permission attaches to the parent terminal (Warp / Terminal / iTerm), not the
-binary itself — restart the terminal once after granting.
+Permission setup (the only manual step):
+  1. System Settings -> Privacy & Security -> Screen & System Audio Recording
+  2. Add the parent terminal app (Warp / Terminal / iTerm) AND/OR add
+     the binary $SYSAUDIO_BIN directly to the list
+  3. Restart the terminal so the grant takes effect
+
+Then you're done. Next time you join a Zoom/Teams/Meet/FaceTime call, the
+daemon will detect mic activity within 2s and start capturing.
 
 Transcripts land in ~/transcripts/ (picked up by context-orchestrator's transcript-watcher).
 Pause:  touch ~/.meeting-capture/paused
