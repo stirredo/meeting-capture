@@ -20,6 +20,18 @@ fi
 OS_VERSION=$(sw_vers -productVersion)
 echo "macOS $OS_VERSION, Swift $(swift --version | head -1)"
 
+# 1b. ffmpeg (mlx-whisper shells out to it to decode WAVs)
+if ! command -v ffmpeg &>/dev/null; then
+    if command -v brew &>/dev/null; then
+        echo "Installing ffmpeg (mlx-whisper dependency)..."
+        brew install ffmpeg
+    else
+        echo "ERROR: ffmpeg is required by mlx-whisper but not on PATH and brew is not installed."
+        echo "Install ffmpeg manually (e.g. https://evermeet.cx/ffmpeg/) and re-run."
+        exit 1
+    fi
+fi
+
 # 2. Build audiotee (Core Audio Tap CLI — no driver, no sudo)
 mkdir -p "$SCRIPT_DIR/vendor" "$SCRIPT_DIR/bin"
 if [ ! -d "$VENDOR/.git" ]; then
@@ -33,9 +45,10 @@ fi
 echo "Building audiotee (release)..."
 (cd "$VENDOR" && swift build -c release --quiet)
 
-BUILT=$(find "$VENDOR/.build/release" -maxdepth 1 -type f -name audiotee -perm -111 | head -1)
-if [ -z "$BUILT" ]; then
-    echo "audiotee build failed — no binary at $VENDOR/.build/release/audiotee"
+BIN_DIR=$(cd "$VENDOR" && swift build -c release --show-bin-path)
+BUILT="$BIN_DIR/audiotee"
+if [ ! -x "$BUILT" ]; then
+    echo "audiotee build failed — no binary at $BUILT"
     exit 1
 fi
 
