@@ -1,40 +1,20 @@
 # meeting-capture
 
-Always-on, fully local audio capture daemon for macOS. Records system audio (whatever is playing through your speakers — Zoom, Meet, Teams, browser calls, anything) and writes timestamped Markdown transcripts to `~/transcripts/`. **No driver, no kernel extension, no `sudo`, no reboot.** Just one user-grantable Audio Capture permission.
+Always-on, fully local meeting transcription daemon for macOS. Detects when another app is using your microphone (any video/audio call), captures system audio output via ScreenCaptureKit, transcribes it locally with mlx-whisper, and writes timestamped Markdown transcripts to `~/transcripts/`.
 
-Designed to feed [context-orchestrator](https://github.com/stirredo/context-orchestrator) — meeting-capture writes transcripts; context-orchestrator's `transcript-watcher` indexes them. The two are coupled only through the `~/transcripts/` directory, so each can fail independently.
+No driver, no kernel extension, no `sudo`, no reboot. One user-grantable Screen Recording permission.
 
-## Why
-
-Manual save-after-meeting workflows fail in practice (real-world adherence ~40%). Otter joins meetings as a visible bot. Granola needs a Google Workspace account. Cluely is cloud-only. None offer invisible local capture with auto file output, so this project does.
-
-## How it works
-
-```
-[mic activates]   →  daemon detects via AVCaptureDevice.isInUseByAnotherApplication
-System audio      →  audiotee (Core Audio Tap, macOS 14.2+)
-                  →  PCM stream on stdout (int16 @ 16kHz mono)
-                  →  Python daemon (silence-chunked, ~3s gap = chunk boundary)
-                  →  mlx-whisper (local transcription, Apple Silicon)
-                  →  ~/transcripts/meeting-YYYY-MM-DDTHH-MM-SS.md
-[mic deactivates] →  audiotee terminated, in-flight chunk flushed, daemon idles
-```
-
-**Mic-activity gating:** the daemon only records when another app (Zoom, Teams, FaceTime, browser meeting, etc.) is using your microphone. Otherwise it sits idle — no audio captured, no CPU spent. This means random YouTube/podcast/music audio is **not** captured; only actual calls are.
-
-A new transcript file is started whenever the gap between chunks exceeds 15 minutes (= a new meeting). Mid-meeting mic mutes don't fragment the file (subsequent chunks within 15 min append to the same session). Raw audio chunks are deleted after transcription. The daemon stays in the background via launchd.
-
-The audio source is [`audiotee`](https://github.com/makeusabrew/audiotee), a tiny Swift CLI that wraps Apple's Core Audio Tap API (`CATapDescription` / `AudioHardwareCreateProcessTap`). This is the same API category that lets Cluely-style tools work without admin rights.
+Pairs with [context-orchestrator](https://github.com/stirredo/context-orchestrator), which auto-indexes the transcripts into a searchable vector store. The two are coupled only via the `~/transcripts/` directory; either runs independently.
 
 ## Requirements
 
-- macOS **14.2+** (Core Audio Tap API)
+- macOS 13.0 or later (ScreenCaptureKit)
 - Apple Silicon (mlx-whisper)
 - Python 3.10+
-- Xcode command-line tools (for building `audiotee` — `xcode-select --install`)
-- **No `sudo` required**
+- Xcode command-line tools (`xcode-select --install`)
+- Homebrew (for `ffmpeg`)
 
-## Setup
+## Install
 
 ```bash
 git clone https://github.com/stirredo/meeting-capture.git
@@ -42,36 +22,74 @@ cd meeting-capture
 ./setup.sh
 ```
 
-`setup.sh` clones [audiotee](https://github.com/makeusabrew/audiotee) into `vendor/`, builds it via `swift build -c release`, ad-hoc codesigns the binary, drops it in `bin/audiotee`, then creates a Python venv and installs the package. It also fires `audiotee` once briefly to trigger the system permission prompt.
+`setup.sh` checks prerequisites, installs `ffmpeg`, builds the `sysaudio` Swift binary, creates a Python venv, registers the launchd auto-start agent, and triggers the macOS permission prompt.
 
-After setup, approve the prompt in **System Settings → Privacy & Security → Audio Capture** for the `audiotee` binary. That's it — no kernel driver to authorize, no reboot.
+After setup:
 
-## Use
+1. Open **System Settings → Privacy & Security → Screen & System Audio Recording**.
+2. Add the parent terminal application (Warp, Terminal, iTerm, etc.) — macOS attributes the permission to the parent process, not to the CLI binary itself.
+3. Restart that terminal once for the grant to take effect.
+
+To verify the install:
 
 ```bash
-.venv/bin/meeting-capture check       # verify audiotee + permission
-.venv/bin/meeting-capture install     # install launchd auto-start agent
-.venv/bin/meeting-capture status      # daemon + mic + last transcript + log line
-.venv/bin/meeting-capture mic         # show current mic-activity state
-.venv/bin/meeting-capture last        # print path of most recent transcript
-.venv/bin/meeting-capture tail        # follow the daemon log
-.venv/bin/meeting-capture pause       # touches ~/.meeting-capture/paused
-.venv/bin/meeting-capture resume
-.venv/bin/meeting-capture stop
-.venv/bin/meeting-capture start
-.venv/bin/meeting-capture run         # foreground (debugging)
+.venv/bin/meeting-capture doctor
 ```
 
-For sensitive calls, `pause` until done, then `resume`.
+## Usage
+
+The daemon runs in the background. Day-to-day there is nothing to do — when you join a Zoom / Teams / Meet / FaceTime / browser meeting, the daemon detects the mic activation within ~2 seconds, starts capturing, and writes the transcript as the meeting progresses. When you leave the call the daemon flushes the in-flight chunk and idles until the next meeting.
+
+CLI commands for inspection and control:
+
+| Command | Purpose |
+|---|---|
+| `meeting-capture status` | Daemon state, mic state, last transcript, last log line |
+| `meeting-capture doctor` | Full health check of all prerequisites and components |
+| `meeting-capture mic` | Show current microphone-activity state |
+| `meeting-capture last` | Print the path of the most recent transcript |
+| `meeting-capture tail` | Follow the daemon log |
+| `meeting-capture pause` | Pause capture (creates `~/.meeting-capture/paused`) |
+| `meeting-capture resume` | Resume capture |
+| `meeting-capture install` | Install the launchd auto-start agent |
+| `meeting-capture uninstall` | Remove the launchd auto-start agent |
+| `meeting-capture start` / `stop` | Manual daemon control |
+| `meeting-capture run` | Run daemon in the foreground (for debugging) |
+
+## Architecture
+
+```
+mic activates                                     mic deactivates
+     │                                                  │
+     ▼                                                  ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  meeting-capture daemon (Python, launchd-managed)                │
+│  - polls Core Audio HAL for mic activity every 2s                │
+│  - while active: spawns sysaudio subprocess                      │
+│  - reads PCM, splits on silence (≥3s gap, ≥8s min, ≤600s max)    │
+│  - hands each chunk to mlx-whisper, appends text to .md file     │
+│  - on mic-off: flushes in-flight buffer, terminates sysaudio     │
+└──────────────────────────────────────────────────────────────────┘
+            │                                          │
+            ▼                                          ▼
+   ┌──────────────────┐                    ┌────────────────────────┐
+   │ sysaudio (Swift) │                    │ ~/transcripts/         │
+   │ ScreenCaptureKit │                    │   meeting-{ISO}.md     │
+   │ → int16 LE PCM   │                    │ (chunks appended       │
+   │   on stdout      │                    │  during the meeting)   │
+   └──────────────────┘                    └────────────────────────┘
+```
+
+A new transcript file is started whenever the gap between chunks exceeds 15 minutes. Mid-meeting mic mutes do not fragment the file. Raw audio chunks are deleted from disk after transcription.
 
 ## Files
 
-- `~/transcripts/meeting-*.md` — final transcripts (this is what context-orchestrator watches)
-- `~/.meeting-capture/daemon.log` — daemon log
+- `~/transcripts/meeting-*.md` — final transcripts
+- `~/.meeting-capture/daemon.log` — daemon log (rotated by macOS)
 - `~/.meeting-capture/paused` — pause sentinel
-- `~/.meeting-capture/audio/` — temporary chunk WAVs (deleted after transcription)
+- `~/.meeting-capture/audio/` — temporary chunk WAVs (deleted post-transcription)
 - `~/Library/LaunchAgents/com.stirredo.meeting-capture.plist` — launchd agent
-- `bin/audiotee` — the audio source binary (built locally, gitignored)
+- `bin/sysaudio` — built audio-capture binary (gitignored)
 
 ## Tests
 
@@ -80,10 +98,10 @@ For sensitive calls, `pause` until done, then `resume`.
 .venv/bin/pytest
 ```
 
-Tests cover silence detection, trimming, audiotee discovery, session bucketing, and transcript appending. End-to-end recording is exercised via the `run` and `check` commands.
+## Troubleshooting
 
-## Why this works on locked-down work laptops
+If `meeting-capture doctor` reports everything green but no transcripts appear:
 
-Pre-2023 system-audio capture on macOS required a kernel-level audio driver (BlackHole, Soundflower, Loopback, etc.), which needs `sudo` to install and an admin reboot to load. On corporate laptops with MDM, that's a non-starter.
-
-Core Audio Tap (macOS 14.2+) and ScreenCaptureKit (macOS 13+) moved system-audio access into user-space APIs gated by per-app TCC permissions. Users can grant those permissions themselves — no admin, no driver, no reboot.
+1. Verify the parent terminal has Screen Recording permission and was restarted after granting.
+2. Check `~/.meeting-capture/daemon.log` for errors from the capture subprocess.
+3. Confirm system audio is actually playing through the default output device (the daemon captures the system audio mixdown).
