@@ -402,7 +402,7 @@ def cmd_vocab(args) -> int:
     print(f"source: {source}")
     print()
     if prompt is None:
-        print("effective prompt: (none — Whisper will not be biased)")
+        print("effective prompt: (none — neither Whisper nor Gemini will be biased)")
     else:
         print("effective prompt:")
         print(prompt)
@@ -435,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_vocab = sub.add_parser(
         "vocab",
-        help="show / edit / clear the per-machine Whisper vocabulary bias",
+        help="show / edit / clear the per-machine vocabulary bias (used by both Whisper and Gemini backends)",
     )
     p_vocab.add_argument(
         "action",

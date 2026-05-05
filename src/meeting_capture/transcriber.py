@@ -29,8 +29,13 @@ edit with `meeting-capture vocab edit`. An empty file means "no prompt at
 all" (explicit opt-out, useful when biasing hurts on a particular machine's
 audio).
 
-Gemini ignores the whisper prompt knobs and uses GEMINI_TRANSCRIBE_INSTRUCTION
-internally — its instruction-following accuracy is high enough that vocab
+Gemini honors the same `~/.meeting-capture/vocab.txt` — the vocab is appended
+to GEMINI_TRANSCRIBE_INSTRUCTION as a context hint so canonical project terms
+(Flink, OpenSearch, Wayfinder, …) survive transcription rather than drifting
+to phonetic guesses (fling, open search, wave finder). One per-machine file
+tunes both backends.
+
+Note: Gemini's instruction-following is strong enough that vocab
 biasing is unnecessary, and it doesn't suffer the silence-hallucination
 behavior that makes the whisper prompt important.
 """
@@ -67,6 +72,15 @@ GEMINI_TRANSCRIBE_INSTRUCTION = (
     "intelligible speech, return an empty string. Do not invent or "
     "filler-fill text. Do not add commentary, summary, or formatting "
     "beyond the speaker prefixes."
+)
+
+# Format string for injecting the per-machine vocab into Gemini's
+# instruction. The vocab is the same source we use for Whisper's
+# initial_prompt — `~/.meeting-capture/vocab.txt`. This way one file
+# tunes both backends.
+GEMINI_VOCAB_HINT_TEMPLATE = (
+    " Context for this audio (use these spellings exactly when you "
+    "hear matching terms): {vocab}"
 )
 
 ENV_TRANSCRIBER = "MEETING_CAPTURE_TRANSCRIBER"
@@ -166,11 +180,19 @@ def _transcribe_gemini(audio_path: Path, model: Optional[str]) -> str:
     model = model or os.environ.get(ENV_GEMINI_MODEL, DEFAULT_GEMINI_MODEL)
     client = genai.Client(api_key=api_key)
 
+    # Append the per-machine vocab as a context hint so Gemini uses
+    # canonical project spellings (Flink, OpenSearch, Wayfinder, …)
+    # instead of phonetic guesses (fling, open search, wave finder).
+    instruction = GEMINI_TRANSCRIBE_INSTRUCTION
+    vocab, _ = resolved_prompt()
+    if vocab:
+        instruction = instruction + GEMINI_VOCAB_HINT_TEMPLATE.format(vocab=vocab)
+
     audio_bytes = audio_path.read_bytes()
     response = client.models.generate_content(
         model=model,
         contents=[
-            GEMINI_TRANSCRIBE_INSTRUCTION,
+            instruction,
             types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
         ],
         config={"temperature": 0.0},

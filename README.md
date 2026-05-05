@@ -94,31 +94,35 @@ A new transcript file is started whenever the gap between chunks exceeds 15 minu
 
 ## Transcription tuning
 
-Defaults: `mlx-community/whisper-large-v3-turbo` with a generic technical-vocab `initial_prompt`. The prompt biases the model toward project-specific proper nouns and acronyms (e.g. internal product names, service acronyms) that no model size can recover on its own.
+Defaults: `mlx-community/whisper-large-v3-turbo` (or `gemini-2.5-flash` when the Gemini backend is enabled) with a generic technical-vocab bias. The bias steers the model toward project-specific proper nouns and acronyms (internal product names, service acronyms) that no model size can recover on its own.
 
 ### Per-machine vocabulary
 
-The recommended way to tune the prompt is the per-machine vocab file at `~/.meeting-capture/vocab.txt`. The daemon re-reads it on every chunk, so changes apply immediately — no restart needed.
+One file, both backends: `~/.meeting-capture/vocab.txt`. Whisper reads it as `initial_prompt`; Gemini gets it appended to its system instruction as a context hint. The daemon re-reads on every chunk — edits apply immediately, no restart.
 
 ```bash
-meeting-capture vocab          # show the effective prompt and where it came from
+meeting-capture vocab          # show the effective vocab and its source
 meeting-capture vocab edit     # open the file in $EDITOR (seeded with the default on first edit)
 meeting-capture vocab clear    # remove the file (fall back to env var or built-in default)
 meeting-capture vocab path     # print the file path (useful for piping)
 ```
 
-Keep it concise — Whisper truncates beyond ~224 tokens (~1000 chars). A natural-sounding sentence in the same register as the audio works best (`This is a meeting about <Project>, <Service>, <acronym1>, ...`). An empty file means "no prompt at all" — useful when biasing turns out to hurt on a particular machine.
+Keep it concise. Whisper truncates beyond ~224 tokens (~1000 chars); Gemini accepts more but the signal-to-noise drops past a paragraph. A natural-sounding sentence in the same register as the audio works best (`This is a meeting about <Project>, <Service>, <acronym1>, ...`). An empty file means "no bias at all" — useful when biasing turns out to hurt on a particular machine.
+
+### Multi-machine
+
+Each machine has its own `~/.meeting-capture/vocab.txt`. The repo ships only a generic default in code; populated vocabularies stay in the user-state directory and never propagate via git. If you want to share a vocab across your own machines, point your dotfile-sync tool (chezmoi, dotbot, iCloud, etc.) at `~/.meeting-capture/vocab.txt` — out of scope for this project.
 
 ### Resolution order
 
-`transcribe()` resolves model and prompt in this order:
+`transcribe()` resolves vocab in this order (both backends):
 
-1. Explicit `initial_prompt=...` argument (programmatic use)
+1. Explicit `initial_prompt=...` argument (programmatic use; whisper backend only)
 2. `~/.meeting-capture/vocab.txt`
 3. `MEETING_CAPTURE_WHISPER_PROMPT` env var
 4. Built-in default
 
-Model resolution is `MEETING_CAPTURE_WHISPER_MODEL` env var, then default.
+Model resolution: `MEETING_CAPTURE_WHISPER_MODEL` (whisper) or `MEETING_CAPTURE_GEMINI_MODEL` (gemini) env var, then default.
 
 ## Tests
 
